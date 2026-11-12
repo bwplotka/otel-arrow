@@ -3768,17 +3768,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37d0827349ebe9ab2c39ad669a597a1515b4f94dd21f9d0d7f9589d57603ea2a"
 
 [[package]]
-name = "expfmt"
-version = "0.1.0"
-source = "git+https://github.com/prometheus/scrape.rs.git?rev=909063a5bdf9844bb1d19f743522b28a8abf2921#909063a5bdf9844bb1d19f743522b28a8abf2921"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7783,7 +7772,6 @@ dependencies = [
  "criterion",
  "csv-core",
  "dhat",
- "expfmt",
  "flate2",
  "fluke-hpack",
  "flume",
@@ -7823,6 +7811,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "parquet",
  "pretty_assertions",
+ "prometheus-scrape-manager",
  "prost 0.14.4",
  "prost-types 0.14.4",
  "rand 0.10.3",
@@ -9138,6 +9127,45 @@ dependencies = [
  "bytesize",
  "human_format",
  "parking_lot 0.12.5",
+]
+
+[[package]]
+name = "prometheus-expfmt"
+version = "0.1.0"
+source = "git+https://github.com/prometheus/scrape.rs.git?rev=d61383f9f977ffdb304fd36279b6d1c6c63d2f72#d61383f9f977ffdb304fd36279b6d1c6c63d2f72"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "prometheus-relabel"
+version = "0.1.0"
+source = "git+https://github.com/prometheus/scrape.rs.git?rev=d61383f9f977ffdb304fd36279b6d1c6c63d2f72#d61383f9f977ffdb304fd36279b6d1c6c63d2f72"
+dependencies = [
+ "regex",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "prometheus-scrape-manager"
+version = "0.1.0"
+source = "git+https://github.com/prometheus/scrape.rs.git?rev=d61383f9f977ffdb304fd36279b6d1c6c63d2f72#d61383f9f977ffdb304fd36279b6d1c6c63d2f72"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "prometheus-expfmt",
+ "prometheus-relabel",
+ "reqwest 0.13.5",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -14,10 +14,15 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 );
 
 use async_trait::async_trait;
-use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords};
+use expfmt::arrow::OtapMetricRecords;
+#[cfg(test)]
+use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
+#[cfg(test)]
 use expfmt::format::{Format, FormatType, response_format};
 use linkme::distributed_slice;
-use otel_arrow_dfe_channel::error::{RecvError, SendError};
+#[cfg(test)]
+use otel_arrow_dfe_channel::error::RecvError;
+use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::MessageSourceLocalEffectHandlerExtension;
 use otel_arrow_dfe_engine::ReceiverFactory;
@@ -30,7 +35,9 @@ use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
-use otel_arrow_dfe_otap::metrics::{ReceiverPullCancellation, ReceiverPullMetrics};
+#[cfg(test)]
+use otel_arrow_dfe_otap::metrics::ReceiverPullCancellation;
+use otel_arrow_dfe_otap::metrics::ReceiverPullMetrics;
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_pdata::otap::transform::{
     AttributesTransform, LiteralValue, UpsertTransform, apply_attribute_transform,
@@ -40,19 +47,31 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_telemetry::instrument::{Counter, Mmsc};
 use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use otel_arrow_dfe_telemetry_macros::metric_set;
+use prometheus_scrape_manager::expfmt;
+use prometheus_scrape_manager::relabel::{
+    ADDRESS_LABEL, INSTANCE_LABEL, JOB_LABEL, LabelSet, METRICS_PATH_LABEL, PARAM_LABEL_PREFIX,
+    SCHEME_LABEL,
+};
+use prometheus_scrape_manager::scrape::{
+    ArrowScrapeSink, ManagerStats, ScrapeConfig, ScrapeManager, ScrapeReport, ScrapeTarget,
+};
 use reqwest::Url;
+#[cfg(test)]
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::net::lookup_host;
+use tokio::sync::Notify;
 use tokio::time::{Instant, sleep_until};
 
 mod config;
 
-pub use config::Config;
+pub use config::{Config, SchedulingConfig, SchedulingModeKind};
 use config::{normalize_target_url, validate_config};
 
 /// The URN for the Prometheus scrape receiver.
@@ -94,27 +113,53 @@ pub struct PrometheusReceiverMetrics {
 /// Default cap for a single `dns_sd_targets` lookup (bounded by `Config::scrape_timeout`).
 const DEFAULT_DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-// TODO(bwplotka): Replace static and DNS target resolution with scrape.rs discovery once
-// https://github.com/prometheus/scrape.rs/issues/36 lands.
-/// Discovers and resolves configured static and DNS scrape target URLs.
-///
-/// Kept separate from [`TargetScraper`] so future shared work coordination can supply per-core
-/// receiver instances with assigned targets while reusing the local scrape and decode path.
+/// Discovers, resolves, and target-relabels configured static and DNS scrape endpoints.
 struct TargetDiscovery {
-    static_urls: Vec<Url>,
+    scrape_config: ScrapeConfig,
+    static_targets: Vec<ScrapeTarget>,
     dns_sd_targets: Vec<String>,
     metrics_path: String,
     dns_lookup_timeout: std::time::Duration,
 }
 
+fn populate_static_target(
+    scrape_config: &ScrapeConfig,
+    url: &Url,
+) -> Result<Option<ScrapeTarget>, otel_arrow_dfe_config::error::Error> {
+    let mut raw_labels = LabelSet::new();
+    let _ = raw_labels.insert(SCHEME_LABEL.to_owned(), url.scheme().to_owned());
+    let _ = raw_labels.insert(ADDRESS_LABEL.to_owned(), target_instance_id(url));
+    let _ = raw_labels.insert(METRICS_PATH_LABEL.to_owned(), url.path().to_owned());
+    for (k, v) in url.query_pairs() {
+        if !k.is_empty() && !v.is_empty() {
+            let param_key = format!("{PARAM_LABEL_PREFIX}{k}");
+            let _ = raw_labels
+                .entry(param_key)
+                .or_insert_with(|| v.into_owned());
+        }
+    }
+    scrape_config
+        .populate_target(&raw_labels, &LabelSet::new())
+        .map_err(
+            |err| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                error: err.to_string(),
+            },
+        )
+}
+
 impl TargetDiscovery {
     fn from_config(config: &Config) -> Result<Self, otel_arrow_dfe_config::error::Error> {
-        let mut static_urls = Vec::with_capacity(config.targets.len());
+        let scrape_config = config.to_scrape_config()?;
+        let mut static_targets = Vec::with_capacity(config.targets.len());
         for target in &config.targets {
-            static_urls.push(normalize_target_url(target, &config.metrics_path)?);
+            let url = normalize_target_url(target, &config.metrics_path)?;
+            if let Some(populated) = populate_static_target(&scrape_config, &url)? {
+                static_targets.push(populated);
+            }
         }
         Ok(Self {
-            static_urls,
+            scrape_config,
+            static_targets,
             dns_sd_targets: config
                 .dns_sd_targets
                 .iter()
@@ -127,25 +172,50 @@ impl TargetDiscovery {
 
     #[cfg(test)]
     async fn resolve_targets(&self) -> Vec<Url> {
-        self.resolve_targets_counted().await.0
+        self.resolve_scrape_targets_counted()
+            .await
+            .0
+            .into_iter()
+            .map(|t| t.url().clone())
+            .collect()
     }
 
-    async fn resolve_targets_counted(&self) -> (Vec<Url>, u64) {
-        self.resolve_targets_with(lookup_host).await
-    }
-
-    async fn resolve_targets_with<'a, F, Fut, I>(&'a self, mut lookup: F) -> (Vec<Url>, u64)
+    #[cfg(test)]
+    async fn resolve_targets_with<'a, F, Fut, I>(&'a self, lookup: F) -> (Vec<Url>, u64)
     where
         F: FnMut(&'a str) -> Fut,
         Fut: Future<Output = std::io::Result<I>>,
         I: Iterator<Item = std::net::SocketAddr>,
     {
-        let mut all_urls =
-            Vec::with_capacity(self.static_urls.len() + self.dns_sd_targets.len() * 4);
-        all_urls.extend(self.static_urls.iter().cloned());
+        let (targets, failures) = self.resolve_scrape_targets_with(lookup).await;
+        (
+            targets.into_iter().map(|t| t.url().clone()).collect(),
+            failures,
+        )
+    }
+
+    async fn resolve_scrape_targets_counted(&self) -> (Vec<ScrapeTarget>, u64) {
+        self.resolve_scrape_targets_with(lookup_host).await
+    }
+
+    async fn resolve_scrape_targets_with<'a, F, Fut, I>(
+        &'a self,
+        mut lookup: F,
+    ) -> (Vec<ScrapeTarget>, u64)
+    where
+        F: FnMut(&'a str) -> Fut,
+        Fut: Future<Output = std::io::Result<I>>,
+        I: Iterator<Item = std::net::SocketAddr>,
+    {
+        let mut all_targets =
+            Vec::with_capacity(self.static_targets.len() + self.dns_sd_targets.len() * 4);
+        all_targets.extend(self.static_targets.iter().cloned());
         let mut dns_failures = 0_u64;
 
         for dns_target in &self.dns_sd_targets {
+            let (dns_name, dns_port) = dns_target
+                .rsplit_once(':')
+                .unwrap_or((dns_target.as_str(), ""));
             match tokio::time::timeout(self.dns_lookup_timeout, lookup(dns_target.as_str())).await {
                 Ok(Ok(addrs)) => {
                     let mut sorted_addrs: Vec<_> = addrs.collect();
@@ -160,17 +230,35 @@ impl TargetDiscovery {
                         );
                     }
                     for addr in sorted_addrs {
-                        let candidate = format!("http://{addr}{}", self.metrics_path);
-                        match Url::parse(&candidate) {
-                            Ok(url) => all_urls.push(url),
+                        let mut raw_labels = LabelSet::new();
+                        let _ = raw_labels.insert(ADDRESS_LABEL.to_owned(), addr.to_string());
+                        let _ = raw_labels.insert(SCHEME_LABEL.to_owned(), "http".to_owned());
+                        let _ = raw_labels
+                            .insert(METRICS_PATH_LABEL.to_owned(), self.metrics_path.clone());
+                        if !dns_name.is_empty() {
+                            let _ = raw_labels
+                                .insert("__meta_dns_name".to_owned(), dns_name.to_owned());
+                        }
+                        if !dns_port.is_empty() {
+                            let _ = raw_labels.insert(
+                                "__meta_dns_srv_record_port".to_owned(),
+                                dns_port.to_owned(),
+                            );
+                        }
+                        match self
+                            .scrape_config
+                            .populate_target(&raw_labels, &LabelSet::new())
+                        {
+                            Ok(Some(scrape_target)) => all_targets.push(scrape_target),
+                            Ok(None) => {}
                             Err(err) => {
                                 dns_failures += 1;
                                 otel_warn!(
                                     "prometheus_receiver.dns_invalid_target_url",
                                     target = dns_target.as_str(),
-                                    candidate = candidate.as_str(),
+                                    address = addr.to_string(),
                                     error = err.to_string(),
-                                    message = "failed to build scrape URL for resolved DNS address"
+                                    message = "failed to populate relabeled scrape target for resolved DNS address"
                                 );
                             }
                         }
@@ -198,7 +286,7 @@ impl TargetDiscovery {
             }
         }
 
-        (all_urls, dns_failures)
+        (all_targets, dns_failures)
     }
 }
 
@@ -209,6 +297,7 @@ struct ReceiverTelemetry {
 }
 
 impl ReceiverTelemetry {
+    #[cfg(test)]
     fn record_scrape_failure(&mut self, started: StdInstant) {
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.scrapes_failed.add(1);
@@ -217,11 +306,13 @@ impl ReceiverTelemetry {
     }
 }
 
+#[cfg(test)]
 struct ActiveScrapeCancel {
     pull: ReceiverPullCancellation,
     started: StdInstant,
 }
 
+#[cfg(test)]
 impl ActiveScrapeCancel {
     fn cancel(&self, telemetry: &mut ReceiverTelemetry) {
         self.pull.cancel();
@@ -312,6 +403,7 @@ impl PrometheusReceiver {
     }
 }
 
+#[cfg(test)]
 fn elapsed_nanos(start: StdInstant) -> f64 {
     start.elapsed().as_secs_f64() * 1e9
 }
@@ -332,9 +424,7 @@ fn terminal_state(deadline: StdInstant, telemetry: &mut ReceiverTelemetry) -> Te
     TerminalState::new(deadline, snapshots)
 }
 
-// TODO(bwplotka): Upstream scraper Accept header construction, text 1.0.0 handling, and fallback
-// Content-Type resolution to expfmt::format in https://github.com/prometheus/scrape.rs/issues/34.
-/// Resolves the HTTP `Accept` header value advertised during scrapes.
+#[cfg(test)]
 pub(crate) fn build_accept_header(enable_open_metrics: bool) -> &'static str {
     if enable_open_metrics {
         "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.6,application/openmetrics-text;version=0.0.1;q=0.5,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.4,text/plain;version=0.0.4;q=0.3"
@@ -343,12 +433,7 @@ pub(crate) fn build_accept_header(enable_open_metrics: bool) -> &'static str {
     }
 }
 
-// TODO(bwplotka): Replace fallback Content-Type resolution with expfmt::format scraper
-// negotiation once https://github.com/prometheus/scrape.rs/issues/34 lands.
-/// Determines the exposition [`Format`] from an HTTP `Content-Type` header.
-///
-/// Falls back to OpenMetrics 1.0 when the media type starts with `application/openmetrics-text`
-/// and to Prometheus text (`0.0.4`) when the header is missing or omits version parameters.
+#[cfg(test)]
 pub(crate) fn resolve_response_format(content_type: Option<&str>) -> Format {
     let Some(raw) = content_type else {
         return Format::TEXT;
@@ -440,6 +525,7 @@ pub(crate) fn target_instance_id(target_url: &Url) -> String {
 
 /// Builds an [`AttributesTransform`] that upserts `service.name` and `service.instance.id` on
 /// scraped target batches.
+#[cfg(test)]
 pub(crate) fn build_target_resource_transform(
     job_name: &str,
     target_url: &Url,
@@ -454,6 +540,46 @@ pub(crate) fn build_target_resource_transform(
             LiteralValue::Str(target_instance_id(target_url)),
         ),
     ])))
+}
+
+/// Builds an [`AttributesTransform`] mapping a [`ScrapeTarget`]'s relabeled public labels onto
+/// OTAP `ResourceAttrs` (`job` -> `service.name`, `instance` -> `service.instance.id`, plus all
+/// remaining public target labels).
+pub(crate) fn build_scrape_target_resource_transform(
+    target: &ScrapeTarget,
+    default_job_name: &str,
+) -> AttributesTransform {
+    let labels = target.labels();
+    let mut attrs: BTreeMap<String, LiteralValue> = BTreeMap::new();
+    let service_name = labels
+        .get("service.name")
+        .or_else(|| labels.get(JOB_LABEL))
+        .map_or(default_job_name, String::as_str);
+    let _ = attrs.insert(
+        "service.name".to_owned(),
+        LiteralValue::Str(service_name.to_owned()),
+    );
+    let instance_id = labels
+        .get("service.instance.id")
+        .or_else(|| labels.get(INSTANCE_LABEL))
+        .cloned()
+        .unwrap_or_else(|| target_instance_id(target.url()));
+    let _ = attrs.insert(
+        "service.instance.id".to_owned(),
+        LiteralValue::Str(instance_id),
+    );
+
+    for (k, v) in labels {
+        if k == JOB_LABEL
+            || k == INSTANCE_LABEL
+            || k == "service.name"
+            || k == "service.instance.id"
+        {
+            continue;
+        }
+        let _ = attrs.insert(k.clone(), LiteralValue::Str(v.clone()));
+    }
+    AttributesTransform::default().with_upsert(UpsertTransform::new(attrs))
 }
 
 const fn is_metric_data_point_table(payload_type: ArrowPayloadType) -> bool {
@@ -612,7 +738,8 @@ fn override_time_unix_nano(
     })
 }
 
-/// Local HTTP scraper and `ArrowDecoder` state for assigned targets.
+/// Local HTTP scraper and `ArrowDecoder` state retained for low-level cooperative poll unit tests.
+#[cfg(test)]
 struct TargetScraper {
     client: reqwest::Client,
     job_name: String,
@@ -625,6 +752,7 @@ struct TargetScraper {
     decoder: ArrowDecoder,
 }
 
+#[cfg(test)]
 impl TargetScraper {
     fn new(config: &Config, receiver_id: NodeId) -> Result<Self, Error> {
         otel_arrow_dfe_otap::crypto::ensure_crypto_provider();
@@ -996,6 +1124,7 @@ impl TargetScraper {
     }
 }
 
+#[cfg(test)]
 async fn handle_control_msg(
     msg: Result<NodeControlMsg<OtapPdata>, RecvError>,
     effect_handler: &local::EffectHandler<OtapPdata>,
@@ -1039,6 +1168,7 @@ async fn handle_control_msg(
     }
 }
 
+#[cfg(test)]
 async fn poll_with_control<F, T>(
     fut: F,
     ctrl_msg_recv: &mut local::ControlChannel<OtapPdata>,
@@ -1067,6 +1197,214 @@ where
     }
 }
 
+struct SharedScrapeState {
+    telemetry: ReceiverTelemetry,
+    last_started: u64,
+    last_overruns: u64,
+    last_points_decoded: u64,
+    in_batch_delivery: bool,
+    drain_deadline: Option<StdInstant>,
+}
+
+impl SharedScrapeState {
+    const fn new(telemetry: ReceiverTelemetry) -> Self {
+        Self {
+            telemetry,
+            last_started: 0,
+            last_overruns: 0,
+            last_points_decoded: 0,
+            in_batch_delivery: false,
+            drain_deadline: None,
+        }
+    }
+
+    fn sync_manager_counters(&mut self, stats: ManagerStats) {
+        let started_delta = stats.scrapes_started.saturating_sub(self.last_started);
+        self.last_started = stats.scrapes_started;
+        let overrun_delta = stats.scrapes_overrun.saturating_sub(self.last_overruns);
+        self.last_overruns = stats.scrapes_overrun;
+        let points_delta = stats
+            .data_points_decoded
+            .saturating_sub(self.last_points_decoded);
+        self.last_points_decoded = stats.data_points_decoded;
+
+        if let Some(metrics) = self.telemetry.metrics.as_mut() {
+            if started_delta > 0 {
+                metrics.scrapes_started.add(started_delta);
+            }
+            if overrun_delta > 0 {
+                metrics.scrapes_overrun.add(overrun_delta);
+                otel_warn!(
+                    "prometheus_receiver.scrape_cycle_overrun",
+                    skipped_ticks = overrun_delta,
+                    message =
+                        "scrape target or cycle overran scrape_interval; skipping missed intervals"
+                );
+            }
+            if points_delta > 0 {
+                metrics.data_points_decoded.add(points_delta);
+            }
+        }
+    }
+
+    fn cancel_in_flight_scrapes(&mut self, stats: ManagerStats) {
+        self.sync_manager_counters(stats);
+        let finished = stats.scrapes_succeeded.saturating_add(stats.scrapes_failed);
+        let in_flight = stats.scrapes_started.saturating_sub(finished);
+        for _ in 0..in_flight {
+            let pull_attempt = self.telemetry.pull.processing();
+            pull_attempt.cancellation_handle().cancel();
+            if let Some(metrics) = self.telemetry.metrics.as_mut() {
+                metrics.scrapes_failed.add(1);
+            }
+        }
+    }
+}
+
+struct ReceiverScrapeSink<'a> {
+    manager: &'a ScrapeManager,
+    config: &'a Config,
+    start_timestamp_ns: i64,
+    effect_handler: &'a local::EffectHandler<OtapPdata>,
+    state: Rc<RefCell<SharedScrapeState>>,
+    drain_notify: Rc<Notify>,
+}
+
+impl ArrowScrapeSink for ReceiverScrapeSink<'_> {
+    async fn on_batch(
+        &self,
+        target: &ScrapeTarget,
+        scrape_timestamp_ms: i64,
+        records: OtapMetricRecords,
+    ) -> ControlFlow<()> {
+        {
+            let mut st = self.state.borrow_mut();
+            st.in_batch_delivery = true;
+            if let Some(deadline) = st.drain_deadline
+                && StdInstant::now() >= deadline
+            {
+                return ControlFlow::Break(());
+            }
+        }
+
+        let resource_transform =
+            build_scrape_target_resource_transform(target, &self.config.job_name);
+        let otap = match records_to_otap_with_resource(
+            &records,
+            self.config.honor_timestamps,
+            scrape_timestamp_ms,
+            Some(self.start_timestamp_ns),
+            Some(&resource_transform),
+        ) {
+            Ok(otap) => otap,
+            Err(err) => {
+                otel_warn!(
+                    "prometheus_receiver.otap_conversion_error",
+                    target = target.url().as_str(),
+                    error = err.to_string(),
+                    message = "failed to convert decoded Arrow batch into OtapArrowRecords"
+                );
+                return ControlFlow::Continue(());
+            }
+        };
+
+        let pdata = OtapPdata::new(Context::default(), otap.into());
+        let send_result = match self.effect_handler.try_send_message_with_source_node(pdata) {
+            Ok(()) => Ok(()),
+            Err(TypedError::ChannelSendError(SendError::Full(pdata))) => {
+                let mut send = Box::pin(self.effect_handler.send_message_with_source_node(pdata));
+                loop {
+                    let notified = self.drain_notify.notified();
+                    tokio::pin!(notified);
+                    let _ = notified.as_mut().enable();
+                    let cur_deadline = self.state.borrow().drain_deadline;
+                    if let Some(deadline) = cur_deadline
+                        && StdInstant::now() >= deadline
+                    {
+                        return ControlFlow::Break(());
+                    }
+
+                    tokio::select! {
+                        biased;
+
+                        _ = async {
+                            match cur_deadline {
+                                Some(deadline) => sleep_until(Instant::from_std(deadline)).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }, if cur_deadline.is_some() => {
+                            return ControlFlow::Break(());
+                        }
+
+                        () = &mut notified, if cur_deadline.is_none() => {}
+
+                        res = send.as_mut() => break res,
+                    }
+                }
+            }
+            Err(other) => Err(other),
+        };
+
+        let mut st = self.state.borrow_mut();
+        match send_result {
+            Ok(()) => {
+                if let Some(metrics) = st.telemetry.metrics.as_mut() {
+                    metrics.batches_sent.add(1);
+                }
+            }
+            Err(err) => {
+                if let Some(metrics) = st.telemetry.metrics.as_mut() {
+                    metrics.send_failures.add(1);
+                }
+                otel_warn!(
+                    "prometheus_receiver.send_error",
+                    error = err.to_string(),
+                    message = "failed to send scraped metrics batch downstream"
+                );
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    async fn on_scrape_complete(
+        &self,
+        target: &ScrapeTarget,
+        report: ScrapeReport,
+    ) -> ControlFlow<()> {
+        let mut st = self.state.borrow_mut();
+        st.in_batch_delivery = false;
+        st.sync_manager_counters(self.manager.stats());
+
+        let pull_attempt = st.telemetry.pull.processing();
+        let duration_ns = report.duration.as_secs_f64() * 1e9;
+        if report.up {
+            pull_attempt.success();
+            if let Some(metrics) = st.telemetry.metrics.as_mut() {
+                metrics.scrapes_completed.add(1);
+                metrics.scrape_duration_ns.record(duration_ns);
+            }
+        } else {
+            pull_attempt.cancellation_handle().cancel();
+            if let Some(metrics) = st.telemetry.metrics.as_mut() {
+                metrics.scrapes_failed.add(1);
+                metrics.scrape_duration_ns.record(duration_ns);
+            }
+            otel_warn!(
+                "prometheus_receiver.scrape_failed",
+                target = target.url().as_str(),
+                error = report.error.as_deref().unwrap_or("unknown"),
+                message = "target scrape failed"
+            );
+        }
+
+        if st.drain_deadline.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl local::Receiver<OtapPdata> for PrometheusReceiver {
     async fn start(
@@ -1080,83 +1418,171 @@ impl local::Receiver<OtapPdata> for PrometheusReceiver {
             mut telemetry,
         } = *self;
 
-        let mut scraper = TargetScraper::new(&config, effect_handler.receiver_id())?;
-        let mut next_due = Instant::now() + config.initial_delay;
+        otel_arrow_dfe_otap::crypto::ensure_crypto_provider();
+        let receiver_id = effect_handler.receiver_id();
+        let scrape_config = config
+            .to_scrape_config()
+            .map_err(|err| Error::ReceiverError {
+                receiver: receiver_id.clone(),
+                kind: ReceiverErrorKind::Configuration,
+                error: err.to_string(),
+                source_detail: String::new(),
+            })?;
+        let manager =
+            ScrapeManager::with_reqwest(scrape_config).map_err(|err| Error::ReceiverError {
+                receiver: receiver_id,
+                kind: ReceiverErrorKind::Configuration,
+                error: format!("failed to build ScrapeManager: {err}"),
+                source_detail: String::new(),
+            })?;
 
-        loop {
-            tokio::select! {
-                biased;
+        let start_timestamp_ns = current_timestamp_ms()
+            .saturating_sub(1_000)
+            .saturating_mul(1_000_000);
 
-                msg = ctrl_msg_recv.recv() => {
-                    if let ControlFlow::Break(exit) =
-                        handle_control_msg(msg, &effect_handler, &mut telemetry, None).await
-                    {
-                        return exit;
-                    }
-                }
+        let (initial_targets, initial_dns_failures) = {
+            let mut init_fut = std::pin::pin!(discovery.resolve_scrape_targets_counted());
+            loop {
+                tokio::select! {
+                    biased;
 
-                _ = sleep_until(next_due) => {
-                    let now = Instant::now();
-                    let elapsed = now.saturating_duration_since(next_due);
-                    let missed_ticks = elapsed.as_nanos() / config.scrape_interval.as_nanos() + 1;
-                    if missed_ticks > 1 {
-                        let skipped = u64::try_from(missed_ticks - 1).unwrap_or(u64::MAX);
-                        if let Some(metrics) = telemetry.metrics.as_mut() {
-                            metrics.scrapes_overrun.add(skipped);
+                    msg = ctrl_msg_recv.recv() => {
+                        match msg {
+                            Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                                if let Some(metrics) = telemetry.metrics.as_mut() {
+                                    let _ = metrics_reporter.report(metrics);
+                                }
+                                let _ = telemetry.pull.report(&mut metrics_reporter);
+                            }
+                            Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
+                                otel_info!("prometheus_receiver.drain_ingress");
+                                effect_handler.notify_receiver_drained().await?;
+                                return Ok(terminal_state(deadline, &mut telemetry));
+                            }
+                            Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+                                otel_info!("prometheus_receiver.shutdown");
+                                return Ok(terminal_state(deadline, &mut telemetry));
+                            }
+                            Err(err) => return Err(Error::ChannelRecvError(err)),
+                            Ok(_) => {}
                         }
-                        otel_warn!(
-                            "prometheus_receiver.scrape_cycle_overrun",
-                            skipped_ticks = skipped,
-                            scrape_interval_ms =
-                                u64::try_from(config.scrape_interval.as_millis()).unwrap_or(u64::MAX),
-                            message = "scrape cycle overran scrape_interval; skipping missed intervals"
-                        );
-                    }
-                    let advance = config
-                        .scrape_interval
-                        .saturating_mul(u32::try_from(missed_ticks).unwrap_or(u32::MAX));
-                    next_due += advance;
-                    if next_due <= now {
-                        next_due = now + config.scrape_interval;
                     }
 
-                    let (targets, dns_failures) = match poll_with_control(
-                        discovery.resolve_targets_counted(),
-                        &mut ctrl_msg_recv,
-                        &effect_handler,
-                        &mut telemetry,
-                        None,
-                    )
-                    .await
-                    {
-                        ControlFlow::Continue(resolved) => resolved,
-                        ControlFlow::Break(exit) => return exit,
-                    };
-                    if dns_failures > 0
-                        && let Some(metrics) = telemetry.metrics.as_mut()
-                    {
-                        metrics.dns_lookups_failed.add(dns_failures);
+                    resolved = &mut init_fut => break resolved,
+                }
+            }
+        };
+        if initial_dns_failures > 0
+            && let Some(metrics) = telemetry.metrics.as_mut()
+        {
+            metrics.dns_lookups_failed.add(initial_dns_failures);
+        }
+
+        let has_dns_sd = !config.dns_sd_targets.is_empty();
+        let mut next_dns_refresh = Instant::now() + config.scrape_interval;
+        let (manager_ctrl, manager_ctrl_rx) = ScrapeManager::control_channel();
+        let state = Rc::new(RefCell::new(SharedScrapeState::new(telemetry)));
+        let drain_notify = Rc::new(Notify::new());
+
+        let sink = ReceiverScrapeSink {
+            manager: &manager,
+            config: &config,
+            start_timestamp_ns,
+            effect_handler: &effect_handler,
+            state: Rc::clone(&state),
+            drain_notify: Rc::clone(&drain_notify),
+        };
+
+        let exit_outcome = {
+            let mut manager_fut =
+                std::pin::pin!(manager.run_arrow(initial_targets, manager_ctrl_rx, &sink));
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    msg = ctrl_msg_recv.recv() => {
+                        match msg {
+                            Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                                let mut st = state.borrow_mut();
+                                st.sync_manager_counters(manager.stats());
+                                if let Some(metrics) = st.telemetry.metrics.as_mut() {
+                                    let _ = metrics_reporter.report(metrics);
+                                }
+                                let _ = st.telemetry.pull.report(&mut metrics_reporter);
+                            }
+                            Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
+                                otel_info!("prometheus_receiver.drain_ingress");
+                                let delivering = {
+                                    let mut st = state.borrow_mut();
+                                    let prev = st.drain_deadline;
+                                    st.drain_deadline = Some(prev.map_or(deadline, |p| p.min(deadline)));
+                                    st.in_batch_delivery
+                                };
+                                if delivering {
+                                    drain_notify.notify_waiters();
+                                } else {
+                                    let _ = manager_ctrl.shutdown();
+                                    break ControlFlow::Continue((true, deadline));
+                                }
+                            }
+                            Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+                                otel_info!("prometheus_receiver.shutdown");
+                                let _ = manager_ctrl.shutdown();
+                                break ControlFlow::Continue((false, deadline));
+                            }
+                            Err(err) => {
+                                let _ = manager_ctrl.shutdown();
+                                break ControlFlow::Break(Err(Error::ChannelRecvError(err)));
+                            }
+                            Ok(_) => {}
+                        }
                     }
-                    for target_url in &targets {
-                        if let ControlFlow::Break(exit) = scraper
-                            .scrape_target(
-                                target_url,
-                                &mut ctrl_msg_recv,
-                                &effect_handler,
-                                &mut telemetry,
-                            )
-                            .await
+
+                    () = &mut manager_fut => {
+                        let deadline = state
+                            .borrow()
+                            .drain_deadline
+                            .unwrap_or_else(StdInstant::now);
+                        break ControlFlow::Continue((true, deadline));
+                    }
+
+                    () = sleep_until(next_dns_refresh), if has_dns_sd => {
+                        next_dns_refresh = Instant::now() + config.scrape_interval;
+                        let (updated_targets, dns_failures) =
+                            discovery.resolve_scrape_targets_counted().await;
+                        if dns_failures > 0
+                            && let Some(metrics) = state.borrow_mut().telemetry.metrics.as_mut()
                         {
-                            return exit;
+                            metrics.dns_lookups_failed.add(dns_failures);
                         }
-                        tokio::task::consume_budget().await;
+                        let _ = manager_ctrl.update_targets(updated_targets);
                     }
                 }
+            }
+        };
+
+        let stats = manager.stats();
+        match exit_outcome {
+            ControlFlow::Break(err_res) => {
+                state.borrow_mut().cancel_in_flight_scrapes(stats);
+                err_res
+            }
+            ControlFlow::Continue((notify_drained, deadline)) => {
+                {
+                    state.borrow_mut().cancel_in_flight_scrapes(stats);
+                }
+                if notify_drained {
+                    effect_handler.notify_receiver_drained().await?;
+                }
+                let mut st = state.borrow_mut();
+                Ok(terminal_state(deadline, &mut st.telemetry))
             }
         }
     }
 }
 
+#[cfg(test)]
 enum SendOutcome {
     Sent,
     Failed,
@@ -1164,6 +1590,7 @@ enum SendOutcome {
     Exit(Result<TerminalState, Error>),
 }
 
+#[cfg(test)]
 async fn send_otap_batch(
     pdata: OtapPdata,
     drain_deadline: &mut Option<StdInstant>,
@@ -2561,6 +2988,177 @@ mod tests {
                 snapshot.descriptor().name == "receiver.pulled"
                     && snapshot.measurement_attribute_value("outcome") == Some("success")
             }));
+        }));
+    }
+
+    /// Scenario: `PrometheusReceiver` is configured from YAML with `scheduling.mode = "concurrent"`,
+    /// `track_staleness = true`, `relabel_configs` populating resource attributes, and
+    /// `metric_relabel_configs` populating data point attributes across two consecutive scrapes
+    /// where a series disappears.
+    /// Guarantees: `ScrapeManager` attaches relabeled target attributes to `Resource`, attaches
+    /// relabeled sample attributes to `DataPoint`s, and emits `FLAG_NO_RECORDED_VALUE` (`1`) with
+    /// matching attributes when a series disappears.
+    #[test]
+    fn concurrent_jittered_scrape_manager_applies_relabeling_and_staleness() {
+        use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value::Value as AnyVal;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric::Data;
+
+        let (rt, local) = setup_test_runtime();
+        rt.block_on(local.run_until(async move {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local test listener");
+            let addr = listener.local_addr().expect("listener address");
+
+            let body1 = "# TYPE demo_total counter\ndemo_total{route=\"/a\"} 10\ndemo_total{route=\"/b\"} 20\n";
+            let body2 = "# TYPE demo_total counter\ndemo_total{route=\"/a\"} 15\n";
+
+            let server = tokio::task::spawn_local(async move {
+                for body in [body1, body2] {
+                    if let Ok((mut socket, _)) = listener.accept().await {
+                        let mut buf = [0u8; 1024];
+                        let _ = socket.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                }
+            });
+
+            let yaml = format!(
+                r#"
+job_name: avalanche
+scrape_interval: 120ms
+scrape_timeout: 100ms
+track_staleness: true
+honor_labels: false
+jitter_seed: 42
+scheduling:
+  mode: concurrent
+  max_in_flight: 4
+  max_buffered_bodies: 2
+  max_decoders: 1
+targets:
+  - "{addr}"
+relabel_configs:
+  - source_labels: [__address__]
+    regex: "([^:]+):.*"
+    target_label: "server.address"
+    replacement: "$1"
+  - target_label: "k8s.cluster.name"
+    replacement: "bench-cluster"
+metric_relabel_configs:
+  - source_labels: [instance]
+    target_label: exported_instance
+  - target_label: container
+    replacement: avalanche
+"#
+            );
+            let json_val: Value = serde_yaml::from_str(&yaml).expect("valid yaml");
+            let receiver = PrometheusReceiver::from_config(&json_val).expect("valid receiver");
+
+            let TestReceiverHarness {
+                ctrl_chan,
+                ctrl_tx,
+                effect_handler,
+                out_rx,
+                runtime_ctrl_rx: _runtime_ctrl_rx,
+            } = build_test_harness(8);
+
+            let handle = tokio::task::spawn_local(async move {
+                Box::new(receiver).start(ctrl_chan, effect_handler).await
+            });
+
+            let pdata1 = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("scrape 1 arrives")
+                .expect("channel open");
+            let pdata2 = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("scrape 2 arrives")
+                .expect("channel open");
+
+            ctrl_tx
+                .send(NodeControlMsg::Shutdown {
+                    deadline: StdInstant::now() + Duration::from_secs(1),
+                    reason: "done".to_owned(),
+                })
+                .expect("send shutdown");
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("stops")
+                .expect("joins")
+                .expect("clean");
+            let _ = server.await;
+
+            // Verify Resource attributes on scrape 1.
+            let OtlpProtoMessage::Metrics(m1) =
+                otap_to_otlp(pdata1.payload_ref().otap_ref().expect("otap 1"))
+            else {
+                panic!("expected Metrics");
+            };
+            let res_attrs: BTreeMap<String, String> = m1.resource_metrics[0]
+                .resource
+                .as_ref()
+                .unwrap()
+                .attributes
+                .iter()
+                .filter_map(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                    AnyVal::StringValue(s) => Some((kv.key.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                res_attrs.get("service.name").map(String::as_str),
+                Some("avalanche")
+            );
+            assert_eq!(
+                res_attrs.get("server.address").map(String::as_str),
+                Some("127.0.0.1")
+            );
+            assert_eq!(
+                res_attrs.get("k8s.cluster.name").map(String::as_str),
+                Some("bench-cluster")
+            );
+
+            // Verify DataPoint attributes + staleness flag on scrape 2.
+            let OtlpProtoMessage::Metrics(m2) =
+                otap_to_otlp(pdata2.payload_ref().otap_ref().expect("otap 2"))
+            else {
+                panic!("expected Metrics");
+            };
+            let Some(Data::Sum(sum2)) =
+                &m2.resource_metrics[0].scope_metrics[0].metrics[0].data
+            else {
+                panic!("expected Sum");
+            };
+            assert_eq!(sum2.data_points.len(), 2);
+            let stale_dp = sum2
+                .data_points
+                .iter()
+                .find(|dp| dp.flags == expfmt::arrow::DATA_POINT_FLAG_NO_RECORDED_VALUE)
+                .expect("disappeared route=/b series must emit stale marker");
+            let stale_attrs: BTreeMap<String, String> = stale_dp
+                .attributes
+                .iter()
+                .filter_map(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                    AnyVal::StringValue(s) => Some((kv.key.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(stale_attrs.get("route").map(String::as_str), Some("/b"));
+            assert_eq!(
+                stale_attrs.get("container").map(String::as_str),
+                Some("avalanche")
+            );
+            let expected_inst = addr.to_string();
+            assert_eq!(
+                stale_attrs.get("exported_instance").map(String::as_str),
+                Some(expected_inst.as_str())
+            );
         }));
     }
 }

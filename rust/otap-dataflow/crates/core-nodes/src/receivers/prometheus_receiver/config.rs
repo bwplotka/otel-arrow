@@ -3,8 +3,12 @@
 
 //! Configuration types for the Prometheus scrape receiver.
 
+use prometheus_scrape_manager::expfmt;
+use prometheus_scrape_manager::relabel::Config as RelabelConfig;
+use prometheus_scrape_manager::scrape::{SchedulingMode, ScrapeConfig};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 const fn default_scrape_interval() -> Duration {
@@ -35,12 +39,119 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_concurrent_in_flight() -> usize {
+    8
+}
+
+const fn default_concurrent_buffered_bodies() -> usize {
+    2
+}
+
+const fn default_concurrent_decoders() -> usize {
+    1
+}
+
+/// Target scheduling strategy for [`SchedulingConfig`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingModeKind {
+    /// Scrapes all targets sequentially on a job-wide interval tick.
+    #[default]
+    Sequential,
+    /// Schedules each target at its deterministic `hash(target) % scrape_interval` offset while
+    /// running at most one scrape at a time.
+    SequentialJittered,
+    /// Schedules each target at its deterministic jittered offset with bounded concurrent HTTP
+    /// requests, pooled body buffers, and pooled Arrow decoders.
+    Concurrent,
+}
+
+/// Scheduler and scratch-pool bounds for `prometheus_scrape_manager::scrape::ScrapeManager`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// Scheduling cadence and concurrency mode.
+    #[serde(default)]
+    pub mode: SchedulingModeKind,
+
+    /// Maximum concurrent in-flight HTTP scrape requests when `mode = "concurrent"`.
+    #[serde(default = "default_concurrent_in_flight")]
+    pub max_in_flight: usize,
+
+    /// Maximum HTTP response bodies buffered simultaneously when `mode = "concurrent"`.
+    #[serde(default = "default_concurrent_buffered_bodies")]
+    pub max_buffered_bodies: usize,
+
+    /// Maximum reusable `ArrowDecoder` instances pooled simultaneously when `mode = "concurrent"`.
+    #[serde(default = "default_concurrent_decoders")]
+    pub max_decoders: usize,
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            mode: SchedulingModeKind::Sequential,
+            max_in_flight: default_concurrent_in_flight(),
+            max_buffered_bodies: default_concurrent_buffered_bodies(),
+            max_decoders: default_concurrent_decoders(),
+        }
+    }
+}
+
+impl SchedulingConfig {
+    /// Converts [`SchedulingConfig`] into a validated [`SchedulingMode`].
+    pub(crate) fn to_scheduling_mode(
+        self,
+    ) -> Result<SchedulingMode, otel_arrow_dfe_config::error::Error> {
+        match self.mode {
+            SchedulingModeKind::Sequential => Ok(SchedulingMode::sequential()),
+            SchedulingModeKind::SequentialJittered => Ok(SchedulingMode::sequential_jittered()),
+            SchedulingModeKind::Concurrent => {
+                let max_in_flight = NonZeroUsize::new(self.max_in_flight).ok_or_else(|| {
+                    otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                        error: "scheduling.max_in_flight must be greater than zero".to_owned(),
+                    }
+                })?;
+                let max_buffered_bodies =
+                    NonZeroUsize::new(self.max_buffered_bodies).ok_or_else(|| {
+                        otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                            error: "scheduling.max_buffered_bodies must be greater than zero"
+                                .to_owned(),
+                        }
+                    })?;
+                let max_decoders = NonZeroUsize::new(self.max_decoders).ok_or_else(|| {
+                    otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                        error: "scheduling.max_decoders must be greater than zero".to_owned(),
+                    }
+                })?;
+                if max_buffered_bodies > max_in_flight {
+                    return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                        error: format!(
+                            "scheduling.max_buffered_bodies ({max_buffered_bodies}) must not exceed scheduling.max_in_flight ({max_in_flight})"
+                        ),
+                    });
+                }
+                if max_decoders > max_in_flight {
+                    return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                        error: format!(
+                            "scheduling.max_decoders ({max_decoders}) must not exceed scheduling.max_in_flight ({max_in_flight})"
+                        ),
+                    });
+                }
+                Ok(SchedulingMode::concurrent_with_pools(
+                    max_in_flight,
+                    max_buffered_bodies,
+                    max_decoders,
+                ))
+            }
+        }
+    }
+}
+
 /// Configuration for the Prometheus scrape receiver (`urn:otel:receiver:prometheus`).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    // TODO(bwplotka): Populate service.name, service.instance.id, and relabeled target
-    // attributes via ArrowDecoder once https://github.com/prometheus/scrape.rs/issues/35 lands.
     /// Logical job name associated with scraped targets.
     #[serde(default = "default_job_name")]
     pub job_name: String,
@@ -65,9 +176,32 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub honor_timestamps: bool,
 
+    /// Whether sample labels colliding with target labels take precedence (`true`) or are renamed
+    /// with an `exported_` prefix (`false`).
+    #[serde(default)]
+    pub honor_labels: bool,
+
+    /// Whether per-target active series are tracked across scrapes to emit
+    /// `FLAG_NO_RECORDED_VALUE` staleness markers when series disappear, scrapes fail, or targets
+    /// are removed.
+    #[serde(default)]
+    pub track_staleness: bool,
+
     /// Whether to advertise OpenMetrics 1.0 in the HTTP `Accept` header.
     #[serde(default = "default_true")]
     pub enable_open_metrics: bool,
+
+    /// Whether to negotiate `Accept-Encoding: gzip` on target HTTP scrapes.
+    #[serde(default = "default_true")]
+    pub enable_compression: bool,
+
+    /// Deterministic seed mixed into per-target FNV-1a phase offset hashing.
+    #[serde(default)]
+    pub jitter_seed: u64,
+
+    /// Scrape scheduler cadence, concurrency, and buffer pool settings.
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
 
     /// Maximum HTTP response body size in bytes per target scrape (default 16 MiB).
     #[serde(default = "default_max_body_bytes")]
@@ -76,6 +210,14 @@ pub struct Config {
     /// Maximum number of data points per emitted OTAP batch (default `16384`; `0` means unchunked).
     #[serde(default = "default_max_data_points_per_batch")]
     pub max_data_points_per_batch: usize,
+
+    /// Prometheus target relabeling rules (`relabel_configs`) applied during discovery.
+    #[serde(default)]
+    pub relabel_configs: Vec<RelabelConfig>,
+
+    /// Prometheus sample relabeling rules (`metric_relabel_configs`) applied after decoding.
+    #[serde(default)]
+    pub metric_relabel_configs: Vec<RelabelConfig>,
 
     /// Static scrape target endpoints (`host:port` or full `http(s)://...` URLs).
     #[serde(default)]
@@ -95,17 +237,53 @@ impl Default for Config {
             initial_delay: Duration::ZERO,
             metrics_path: default_metrics_path(),
             honor_timestamps: true,
+            honor_labels: false,
+            track_staleness: false,
             enable_open_metrics: true,
+            enable_compression: true,
+            jitter_seed: 0,
+            scheduling: SchedulingConfig::default(),
             max_body_bytes: default_max_body_bytes(),
             max_data_points_per_batch: default_max_data_points_per_batch(),
+            relabel_configs: Vec::new(),
+            metric_relabel_configs: Vec::new(),
             targets: Vec::new(),
             dns_sd_targets: Vec::new(),
         }
     }
 }
 
-// TODO(bwplotka): Replace static URL normalization with scrape.rs discovery once
-// https://github.com/prometheus/scrape.rs/issues/36 lands.
+impl Config {
+    /// Builds a validated [`ScrapeConfig`] for `prometheus_scrape_manager`.
+    pub(crate) fn to_scrape_config(
+        &self,
+    ) -> Result<ScrapeConfig, otel_arrow_dfe_config::error::Error> {
+        let scheduling = self.scheduling.to_scheduling_mode()?;
+        let mut scrape_cfg = ScrapeConfig::new(self.job_name.clone())
+            .with_scrape_interval(self.scrape_interval)
+            .with_scrape_timeout(self.scrape_timeout)
+            .with_initial_delay(self.initial_delay)
+            .with_jitter_seed(self.jitter_seed)
+            .with_scheduling(scheduling)
+            .with_enable_open_metrics(self.enable_open_metrics)
+            .with_enable_compression(self.enable_compression)
+            .with_honor_labels(self.honor_labels)
+            .with_track_staleness(self.track_staleness)
+            .with_max_body_bytes(self.max_body_bytes)
+            .with_max_data_points_per_batch(self.max_data_points_per_batch)
+            .with_relabel_configs(self.relabel_configs.clone())
+            .with_metric_relabel_configs(self.metric_relabel_configs.clone());
+        scrape_cfg.honor_timestamps = self.honor_timestamps;
+        scrape_cfg.escaping_scheme = expfmt::format::EscapingScheme::AllowUtf8;
+        scrape_cfg.validate().map_err(|err| {
+            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                error: err.to_string(),
+            }
+        })?;
+        Ok(scrape_cfg)
+    }
+}
+
 /// Normalizes a static target (`host:port` or full URL) into an HTTP(S) URL.
 pub(crate) fn normalize_target_url(
     raw_target: &str,
@@ -195,5 +373,6 @@ pub(crate) fn validate_config(config: &Config) -> Result<(), otel_arrow_dfe_conf
             });
         }
     }
+    let _ = config.to_scrape_config()?;
     Ok(())
 }
