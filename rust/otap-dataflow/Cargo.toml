@@ -97,7 +97,7 @@ arrow-schema = { version = "59.3" }
 arrow-array = { version = "59.3" }
 arrow-cast = { version = "59.3" }
 arrow-select = { version = "59.3" }
-prometheus-scrape-manager = { git = "https://github.com/prometheus/scrape.rs.git", rev = "d61383f9f977ffdb304fd36279b6d1c6c63d2f72", default-features = false, features = ["arrow"] }
+prometheus-scrape-manager = { git = "https://github.com/prometheus/scrape.rs.git", rev = "3c29cdb3e30e6b0b97ac451bfb96344d442f1f2d", default-features = false, features = ["arrow"] }
 wasmtime = { version = "49.0.3", default-features = false, features = ["runtime", "component-model", "component-model-async", "cranelift", "std"] }
 wasmtime-wasi = { version = "49.0.3", default-features = false, features = ["p3"] }
 wat = "1.262.0"
